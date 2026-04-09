@@ -10,10 +10,9 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Конфігурація ---
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "ВАШ_ТОКЕН_БОТА")
-MOYSKLAD_TOKEN = os.environ.get("MOYSKLAD_TOKEN", "ВАШ_ТОКЕН_МОЙСКЛАД")
-MANAGER_CHAT_IDS = os.environ.get("MANAGER_CHAT_IDS", "").split(",")  # ID менеджерів через кому
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+MOYSKLAD_TOKEN = os.environ.get("MOYSKLAD_TOKEN", "")
+MANAGER_CHAT_IDS = os.environ.get("MANAGER_CHAT_IDS", "").split(",")
 
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
 MS_HEADERS = {
@@ -22,36 +21,37 @@ MS_HEADERS = {
     "Accept-Encoding": "gzip"
 }
 
-# Стани розмови
 ASK_NAME, BROWSE, ADD_QTY, ADD_COMMENT = range(4)
 
-# Тимчасове сховище даних користувачів
 user_data_store = {}
 
-# ─────────────────────────────────────────────
-# МійСклад: отримання даних
-# ─────────────────────────────────────────────
 
 def get_stock_with_folders():
-    """Отримує товари з ненульовим залишком та їх групи."""
     try:
-        # Залишки
         stock_resp = requests.get(
             f"{MS_BASE}/report/stock/all?filter=stockMode=nonEmpty&limit=1000",
-            headers=MS_HEADERS, timeout=10
+            headers={
+                "Authorization": f"Bearer {os.environ.get('MOYSKLAD_TOKEN', '')}",
+                "Content-Type": "application/json",
+                "Accept-Encoding": "gzip"
+            },
+            timeout=15
         )
         stock_resp.raise_for_status()
         stock_items = stock_resp.json().get("rows", [])
 
-        # Групи товарів
         folders_resp = requests.get(
             f"{MS_BASE}/entity/productfolder?limit=100",
-            headers=MS_HEADERS, timeout=10
+            headers={
+                "Authorization": f"Bearer {os.environ.get('MOYSKLAD_TOKEN', '')}",
+                "Content-Type": "application/json",
+                "Accept-Encoding": "gzip"
+            },
+            timeout=15
         )
         folders_resp.raise_for_status()
         folders = {f["id"]: f["name"] for f in folders_resp.json().get("rows", [])}
 
-        # Групуємо товари по папках
         catalog = {}
         for item in stock_items:
             if item.get("stock", 0) <= 0:
@@ -59,7 +59,6 @@ def get_stock_with_folders():
             folder_href = item.get("folder", {}).get("meta", {}).get("href", "")
             folder_id = folder_href.split("/")[-1] if folder_href else ""
             folder_name = folders.get(folder_id, "Інше")
-            # Беремо тільки верхній рівень папки
             top_folder = folder_name.split("/")[0]
 
             if top_folder not in catalog:
@@ -77,8 +76,7 @@ def get_stock_with_folders():
         return {}
 
 
-def create_order_in_moysklad(user_name: str, cart: list, comment: str):
-    """Створює замовлення покупця в МійСклад."""
+def create_order_in_moysklad(user_name, cart, comment):
     try:
         positions = []
         for item in cart:
@@ -102,9 +100,13 @@ def create_order_in_moysklad(user_name: str, cart: list, comment: str):
 
         resp = requests.post(
             f"{MS_BASE}/entity/customerorder",
-            headers=MS_HEADERS,
+            headers={
+                "Authorization": f"Bearer {os.environ.get('MOYSKLAD_TOKEN', '')}",
+                "Content-Type": "application/json",
+                "Accept-Encoding": "gzip"
+            },
             json=order_data,
-            timeout=10
+            timeout=15
         )
         resp.raise_for_status()
         result = resp.json()
@@ -114,13 +116,9 @@ def create_order_in_moysklad(user_name: str, cart: list, comment: str):
         return None, None
 
 
-# ─────────────────────────────────────────────
-# Допоміжні функції
-# ─────────────────────────────────────────────
-
 def get_user(user_id):
     if user_id not in user_data_store:
-        user_data_store[user_id] = {"name": None, "cart": [], "catalog": {}}
+        user_data_store[user_id] = {"name": None, "cart": [], "catalog": {}, "folder_index": {}}
     return user_data_store[user_id]
 
 
@@ -145,22 +143,24 @@ def main_menu_keyboard():
     ])
 
 
-def folders_keyboard(catalog):
+def folders_keyboard(catalog, folder_index):
     buttons = []
-    for folder in sorted(catalog.keys()):
+    for idx, folder in enumerate(sorted(catalog.keys())):
+        folder_index[str(idx)] = folder
         count = len(catalog[folder])
-        buttons.append([InlineKeyboardButton(f"{folder} ({count})", callback_data=f"folder:{folder}")])
+        buttons.append([InlineKeyboardButton(f"{folder} ({count})", callback_data=f"f:{idx}")])
     buttons.append([InlineKeyboardButton("🛒 Кошик", callback_data="cart")])
     return InlineKeyboardMarkup(buttons)
 
 
-def products_keyboard(products, folder):
+def products_keyboard(products, folder_idx):
     buttons = []
-    for p in products:
-        stock_label = f"залишок: {p['stock']} ящ."
+    for i, p in enumerate(products):
+        name = p['name'][:40] if len(p['name']) > 40 else p['name']
+        stock_label = f"{p['stock']} ящ."
         buttons.append([InlineKeyboardButton(
-            f"{p['name']} — {p['price']:.0f} грн ({stock_label})",
-            callback_data=f"product:{p['id']}"
+            f"{name} — {p['price']:.0f} грн ({stock_label})",
+            callback_data=f"p:{i}:{folder_idx}"
         )])
     buttons.append([InlineKeyboardButton("◀️ Назад", callback_data="catalog")])
     buttons.append([InlineKeyboardButton("🛒 Кошик", callback_data="cart")])
@@ -170,35 +170,26 @@ def products_keyboard(products, folder):
 def cart_keyboard(cart):
     buttons = []
     for i, item in enumerate(cart):
-        buttons.append([InlineKeyboardButton(
-            f"❌ Видалити: {item['name']}",
-            callback_data=f"remove:{i}"
-        )])
+        name = item['name'][:30] if len(item['name']) > 30 else item['name']
+        buttons.append([InlineKeyboardButton(f"❌ {name}", callback_data=f"rm:{i}")])
     buttons.append([InlineKeyboardButton("📦 Продовжити вибір", callback_data="catalog")])
     if cart:
         buttons.append([InlineKeyboardButton("✅ Оформити замовлення", callback_data="checkout")])
-    buttons.append([InlineKeyboardButton("🏠 Головне меню", callback_data="menu")])
+    buttons.append([InlineKeyboardButton("🏠 Меню", callback_data="menu")])
     return InlineKeyboardMarkup(buttons)
 
-
-# ─────────────────────────────────────────────
-# Обробники команд
-# ─────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user = get_user(user_id)
-
     if user["name"]:
         await update.message.reply_text(
             f"👋 З поверненням, {user['name']}!",
             reply_markup=main_menu_keyboard()
         )
         return BROWSE
-
     await update.message.reply_text(
-        "👋 Вітаємо! Це бот для оформлення замовлень.\n\n"
-        "Як вас звати або як називається ваша компанія?"
+        "👋 Вітаємо! Це бот для оформлення замовлень.\n\nЯк вас звати або як називається ваша компанія?"
     )
     return ASK_NAME
 
@@ -207,7 +198,6 @@ async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     name = update.message.text.strip()
     get_user(user_id)["name"] = name
-
     await update.message.reply_text(
         f"✅ Дякуємо, {name}! Оберіть що хочете зробити:",
         reply_markup=main_menu_keyboard()
@@ -222,7 +212,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(user_id)
     data = query.data
 
-    # Головне меню
     if data == "menu":
         await query.edit_message_text(
             f"Привіт, {user['name']}! Оберіть дію:",
@@ -230,11 +219,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return BROWSE
 
-    # Каталог — список груп
     if data == "catalog":
         await query.edit_message_text("⏳ Завантажую каталог...")
         catalog = get_stock_with_folders()
         user["catalog"] = catalog
+        user["folder_index"] = {}
         if not catalog:
             await query.edit_message_text(
                 "😔 Каталог порожній або помилка підключення.",
@@ -243,37 +232,36 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return BROWSE
         await query.edit_message_text(
             "📦 Оберіть групу товарів:",
-            reply_markup=folders_keyboard(catalog)
+            reply_markup=folders_keyboard(catalog, user["folder_index"])
         )
         return BROWSE
 
-    # Група товарів
-    if data.startswith("folder:"):
-        folder = data.split(":", 1)[1]
+    if data.startswith("f:"):
+        idx = data.split(":")[1]
+        folder = user["folder_index"].get(idx)
+        if not folder:
+            await query.edit_message_text("Помилка. Спробуйте ще раз.", reply_markup=main_menu_keyboard())
+            return BROWSE
         products = user["catalog"].get(folder, [])
         if not products:
-            await query.edit_message_text("Товарів у цій групі немає.", reply_markup=folders_keyboard(user["catalog"]))
+            await query.edit_message_text("Товарів у цій групі немає.", reply_markup=folders_keyboard(user["catalog"], user["folder_index"]))
             return BROWSE
         await query.edit_message_text(
             f"📂 {folder}\n\nОберіть товар:",
-            reply_markup=products_keyboard(products, folder)
+            reply_markup=products_keyboard(products, idx)
         )
         return BROWSE
 
-    # Вибір товару → запит кількості
-    if data.startswith("product:"):
-        product_id = data.split(":", 1)[1]
-        # Знаходимо товар у каталозі
-        found = None
-        for products in user["catalog"].values():
-            for p in products:
-                if p["id"] == product_id:
-                    found = p
-                    break
-        if not found:
-            await query.edit_message_text("Товар не знайдено.")
+    if data.startswith("p:"):
+        parts = data.split(":")
+        product_idx = int(parts[1])
+        folder_idx = parts[2]
+        folder = user["folder_index"].get(folder_idx)
+        products = user["catalog"].get(folder, []) if folder else []
+        if not products or product_idx >= len(products):
+            await query.edit_message_text("Товар не знайдено.", reply_markup=main_menu_keyboard())
             return BROWSE
-
+        found = products[product_idx]
         context.user_data["selected_product"] = found
         await query.edit_message_text(
             f"🛒 *{found['name']}*\n"
@@ -284,15 +272,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ADD_QTY
 
-    # Кошик
     if data == "cart":
         cart = user["cart"]
         text = f"🛒 Ваш кошик:\n\n{format_cart(cart)}"
         await query.edit_message_text(text, reply_markup=cart_keyboard(cart))
         return BROWSE
 
-    # Видалити з кошика
-    if data.startswith("remove:"):
+    if data.startswith("rm:"):
         idx = int(data.split(":")[1])
         if 0 <= idx < len(user["cart"]):
             removed = user["cart"].pop(idx)
@@ -302,7 +288,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return BROWSE
 
-    # Оформлення замовлення
     if data == "checkout":
         if not user["cart"]:
             await query.edit_message_text(
@@ -312,34 +297,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return BROWSE
         await query.edit_message_text(
             f"🛒 Ваше замовлення:\n\n{format_cart(user['cart'])}\n\n"
-            f"💬 Додайте коментар до замовлення\n"
-            f"(або напишіть «-» якщо коментар не потрібен):"
+            f"💬 Додайте коментар до замовлення\n(або напишіть «-» якщо не потрібен):"
         )
         return ADD_COMMENT
 
-    # Підтвердження замовлення
     if data == "confirm":
         comment = context.user_data.get("comment", "")
         order_name, order_id = create_order_in_moysklad(user["name"], user["cart"], comment)
-
         if order_id:
             cart_summary = format_cart(user["cart"])
-            success_text = (
-                f"✅ Замовлення прийнято!\n\n"
-                f"👤 Клієнт: {user['name']}\n"
-                f"{cart_summary}"
-            )
+            success_text = f"✅ Замовлення прийнято!\n\n👤 Клієнт: {user['name']}\n{cart_summary}"
             if comment and comment != "-":
                 success_text += f"\n\n💬 Коментар: {comment}"
-
             await query.edit_message_text(success_text)
 
-            # Сповіщення менеджерам
-            manager_text = (
-                f"🔔 *Нове замовлення!*\n\n"
-                f"👤 Клієнт: {user['name']}\n\n"
-                f"{cart_summary}"
-            )
+            manager_text = f"🔔 *Нове замовлення!*\n\n👤 Клієнт: {user['name']}\n\n{cart_summary}"
             if comment and comment != "-":
                 manager_text += f"\n\n💬 Коментар: {comment}"
             manager_text += f"\n\n📋 МійСклад: {order_name}"
@@ -353,22 +325,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             parse_mode="Markdown"
                         )
                     except Exception as e:
-                        logger.error(f"Не вдалось надіслати менеджеру {manager_id}: {e}")
-
+                        logger.error(f"Помилка надсилання менеджеру: {e}")
             user["cart"] = []
         else:
             await query.edit_message_text(
-                "❌ Помилка створення замовлення. Спробуйте ще раз або зв'яжіться з менеджером.",
+                "❌ Помилка створення замовлення. Спробуйте ще раз.",
                 reply_markup=main_menu_keyboard()
             )
         return BROWSE
 
-    # Скасування
     if data == "cancel_order":
-        await query.edit_message_text(
-            "Замовлення скасовано. Кошик збережено.",
-            reply_markup=main_menu_keyboard()
-        )
+        await query.edit_message_text("Замовлення скасовано.", reply_markup=main_menu_keyboard())
         return BROWSE
 
     return BROWSE
@@ -378,7 +345,6 @@ async def handle_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user = get_user(user_id)
     text = update.message.text.strip()
-
     try:
         qty = int(text)
         if qty <= 0:
@@ -393,12 +359,9 @@ async def handle_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return BROWSE
 
     if qty > product["stock"]:
-        await update.message.reply_text(
-            f"⚠️ В наявності тільки {product['stock']} ящ. Введіть іншу кількість:"
-        )
+        await update.message.reply_text(f"⚠️ В наявності тільки {product['stock']} ящ. Введіть іншу кількість:")
         return ADD_QTY
 
-    # Перевіряємо чи товар вже є в кошику
     for item in user["cart"]:
         if item["id"] == product["id"]:
             item["qty"] += qty
@@ -414,10 +377,8 @@ async def handle_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "price": product["price"],
         "qty": qty
     })
-
     await update.message.reply_text(
-        f"✅ Додано: {product['name']} — {qty} ящ.\n\n"
-        f"🛒 В кошику: {len(user['cart'])} позицій",
+        f"✅ Додано: {product['name']} — {qty} ящ.\n\n🛒 В кошику: {len(user['cart'])} позицій",
         reply_markup=main_menu_keyboard()
     )
     return BROWSE
@@ -447,13 +408,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return BROWSE
 
 
-# ─────────────────────────────────────────────
-# Запуск
-# ─────────────────────────────────────────────
-
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-
+    app = Application.builder().token(os.environ.get("TELEGRAM_TOKEN", "")).build()
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -468,7 +424,6 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
         per_message=False,
     )
-
     app.add_handler(conv_handler)
     logger.info("Бот запущено")
     app.run_polling(drop_pending_updates=True)
